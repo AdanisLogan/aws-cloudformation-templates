@@ -1,0 +1,438 @@
+Description:  This template deploys a VPC, with a public subnet and a pair of private subnets spread
+  across two Availability Zones. It deploys an internet gateway, with a default
+  route on the public subnet. It deploys a NAT gateway and default routes for them in the private subnets.
+  It deploys an Oracle RDS instance in the private subnets. It deploys a DMS replication instance and task 
+  to migrate data from an on-premises Oracle database to the RDS instance. It also deploys a DynamoDB endpoint 
+  and a DMS replication configuration to migrate data from the RDS instance to the DynamoDB table.
+
+Parameters:
+  DBUser:
+    Description: The database admin account username
+    Default: admin
+    Type: String
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: ^[a-zA-Z][a-zA-Z0-9]*$
+    ConstraintDescription: Must begin with a letter and contain only alphanumeric characters.
+
+  DBPassword:
+    NoEcho: true
+    Description: The database admin account password
+    Type: String
+    MinLength: 1
+    MaxLength: 41
+    AllowedPattern: ^[a-zA-Z0-9]*$
+    ConstraintDescription: Must contain only alphanumeric characters.
+  
+  DBName:
+    Description: The database name for the target endpoint
+    Type: String
+    Default: ORACLEDB
+    
+  LatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64'
+
+  EnvironmentName:
+    Description: An environment name that is prefixed to resource names
+    Type: String
+
+  VpcCIDR:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: String
+    Default: 10.1.0.0/16
+
+  PublicSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the public subnet in the first Availability Zone
+    Type: String
+    Default: 10.1.2.0/24
+
+  PrivateSubnet1CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.1.4.0/24
+
+  PrivateSubnet2CIDR:
+    Description: Please enter the IP range (CIDR notation) for the private subnet in the first Availability Zone
+    Type: String
+    Default: 10.1.8.0/24
+  
+  Region:
+    Type: String
+    Default: eu-north-1
+    Description: AWS Region in which you want to deploy resources
+
+  SourceUsername:
+    Description: The username for the source endpoint
+    Type: String
+
+  SourcePassword:
+    Description: The password for the source endpoint
+    Type: String
+    NoEcho: true
+
+  SourceServer:
+    Description: The server name or IP for the source endpoint
+    Type: String
+    Default: '193.107.89.54'
+
+  SourceDatabaseName:
+    Description: The database name for the source endpoint
+    Type: String
+    Default: FREEPDB
+
+  ReplicationInstanceClass:
+    Description: The compute and memory capacity of the replication instance
+    Type: String
+    Default: 'dms.t3.small'
+
+  MigrationType:
+    Description: The migration type
+    Type: String
+    Default: 'full-load'
+    AllowedValues:
+      - full-load
+      - cdc
+      - full-load-and-cdc
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-pub-subnet-az1
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 0, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-prv-subnet-az1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [ 1, !GetAZs  '' ]
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-prv-subnet-az2
+
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-gateway-az1
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-pub-route-table
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-prv-route-table
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+  
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet2
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for RDS Oracle DB
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: oracle-se2
+      EngineVersion: '19.0.0.0.ru-2020-07.rur-2020-07.r1'
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-oracle-db
+      AllocatedStorage: '50'
+      DBInstanceClass: db.t3.small
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      LicenseModel: license-included
+      DBName: !Ref DBName
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-oracle-db
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for RDS DB Instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: '1521'
+          ToPort: '1521'
+          CidrIp: 10.1.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-db-sg
+          
+  DmsOnPremSourceEndpoint:
+    Type: 'AWS::DMS::Endpoint'
+    Properties:
+      EndpointIdentifier: !Sub '${EnvironmentName}-source-onprem-endpoint'
+      EndpointType: 'source'
+      EngineName: 'oracle'
+      Username: !Ref SourceUsername
+      Password: !Ref SourcePassword
+      ServerName: !Ref SourceServer
+      Port: 1521
+      DatabaseName: !Ref SourceDatabaseName
+      OracleSettings:
+        UseLogminerReader: false
+
+  DmsRdsSourceEndpoint:
+    Type: 'AWS::DMS::Endpoint'
+    Properties:
+      EndpointIdentifier: !Sub '${EnvironmentName}-source-rds-endpoint'
+      EndpointType: 'source'
+      EngineName: 'oracle'
+      Username: !Ref DBUser
+      Password: !Ref DBPassword
+      ServerName: !GetAtt DBInstance.Endpoint.Address
+      Port: 1521
+      DatabaseName: !Ref DBName
+      
+  DmsRdsTargetEndpoint:
+    Type: 'AWS::DMS::Endpoint'
+    Properties:
+      EndpointIdentifier: !Sub '${EnvironmentName}-target-rds-endpoint'
+      EndpointType: 'target'
+      EngineName: 'oracle'
+      Username: !Ref DBUser
+      Password: !Ref DBPassword
+      ServerName: !GetAtt DBInstance.Endpoint.Address
+      Port: 1521
+      DatabaseName: !Ref DBName
+     
+  DmsDynamoTargetEndpoint:
+    Type: 'AWS::DMS::Endpoint'
+    Properties:
+      EndpointIdentifier: !Sub '${EnvironmentName}-target-dynamodb-endpoint'
+      EndpointType: 'target'
+      EngineName: 'dynamodb'
+      DynamoDbSettings:
+        ServiceAccessRoleArn: !GetAtt DmsDynamoServiceRole.Arn
+
+  DmsVpcRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'dms-vpc-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'dms.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: '/'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonDMSVPCManagementRole'
+
+  DmsDynamoServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-dynamo-dms-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'dms.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: 'DmsDynamoAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:DescribeTable'
+                  - 'dynamodb:CreateTable'
+                  - 'dynamodb:Scan'
+                  - 'dynamodb:Query'
+                  - 'dynamodb:GetItem'
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:UpdateItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:DeleteTable'
+                  - 'dynamodb:ListTables'
+                Resource: '*'        
+
+  DmsReplicationSubnetGroup:
+    Type: 'AWS::DMS::ReplicationSubnetGroup'
+    DependsOn: DmsVpcRole
+    Properties:
+      ReplicationSubnetGroupIdentifier: !Sub '${EnvironmentName}-replication-subnet-group'
+      ReplicationSubnetGroupDescription: 'Subnet group for DMS replication'
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  DmsReplicationInstance:
+    Type: 'AWS::DMS::ReplicationInstance'
+    Properties:
+      ReplicationInstanceIdentifier: !Sub '${EnvironmentName}-replication-instance'
+      ReplicationInstanceClass: !Ref ReplicationInstanceClass
+      ReplicationSubnetGroupIdentifier: !Ref DmsReplicationSubnetGroup
+      VpcSecurityGroupIds:
+        - !GetAtt DmsSecurityGroup.GroupId
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-replication-instance
+
+  DmsSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for DMS replication instance
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1521
+          ToPort: 1521
+          CidrIp: 0.0.0.0/0
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-dms-sg
+
+  DmsReplicationTask:
+    Type: 'AWS::DMS::ReplicationTask'
+    Properties:
+      MigrationType: 'full-load'
+      TableMappings: '{"rules": [{"rule-id": "278722490", "rule-action": "include", "rule-type": "selection", "rule-name": "278722490", "filters": [{"filter-type": "source", "column-name": "id", "filter-conditions": [{ "filter-operator": "gte", "value": "0" }]}], "object-locator": {"schema-name": "ADMIN", "table-name": "TEST_PEOPLE"}}]}'
+      ReplicationTaskIdentifier: !Sub '${EnvironmentName}-replication-task'
+      SourceEndpointArn: !Ref DmsOnPremSourceEndpoint
+      TargetEndpointArn: !Ref DmsRdsTargetEndpoint
+      ReplicationInstanceArn: !Ref DmsReplicationInstance
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-replication-task
+
+  DmsReplicationConfiguration:
+    Type: AWS::DMS::ReplicationConfig
+    Properties:
+      ComputeConfig: 
+        MaxCapacityUnits: 2
+        ReplicationSubnetGroupId: !Ref DmsReplicationSubnetGroup
+        VpcSecurityGroupIds: 
+          - !Ref DmsSecurityGroup
+      ReplicationType: !Ref MigrationType
+      ReplicationConfigIdentifier: !Sub '${EnvironmentName}-replication-config'
+      SourceEndpointArn: !Ref DmsRdsSourceEndpoint
+      TargetEndpointArn: !Ref DmsDynamoTargetEndpoint
+      TableMappings:
+        rules:
+          - rule-id: '278722490'
+            rule-name: '278722490'
+            rule-type: 'selection'
+            rule-action: 'include'
+            object-locator:
+              schema-name: '%'
+              table-name: 'TEST_PEOPLE'
+            filters: []
+      Tags: 
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-replication-config
+
+Outputs:
+  DBInstance:
+    Description: Oracle DB instance
+    Value: !Ref DBInstance
+  
+  ReplicationInstance:
+    Description: DMS replication instance
+    Value: !Ref DmsReplicationInstance
