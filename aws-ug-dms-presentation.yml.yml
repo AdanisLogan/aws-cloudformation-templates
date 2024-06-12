@@ -74,7 +74,6 @@ Parameters:
   SourceServer:
     Description: The server name or IP for the source endpoint
     Type: String
-    Default: '193.107.89.54'
 
   SourceDatabaseName:
     Description: The database name for the source endpoint
